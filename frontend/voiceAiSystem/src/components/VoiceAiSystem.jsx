@@ -22,12 +22,19 @@ const VoiceAIApp = () => {
   const [systemStatus, setSystemStatus] = useState('disconnected');
   const [error, setError] = useState(null);
   const [metrics, setMetrics] = useState({});
+  const [processingProgress, setProcessingProgress] = useState(0);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [activeAudio, setActiveAudio] = useState(null);
+  const [rateLimitError, setRateLimitError] = useState(null);
+  const [retryTime, setRetryTime] = useState(0);
+
 
   // Refs for media handling
   const mediaRecorderRef = useRef(null);
   const audioContextRef = useRef(null);
   const streamRef = useRef(null);
   const audioChunksRef = useRef([]);
+  const progressIntervalRef = useRef(null);
 
   // Audio configuration
   const AUDIO_CONFIG = {
@@ -43,6 +50,8 @@ const VoiceAIApp = () => {
     const newSocket = io(BACKEND_URL, {
       transports: ['websocket'],
       timeout: 20000,
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000,
     });
 
     newSocket.on('connect', () => {
@@ -58,6 +67,7 @@ const VoiceAIApp = () => {
       setSystemStatus('disconnected');
     });
 
+    
     newSocket.on('session_created', (data) => {
       console.log('Session created:', data);
       if (data.session_id) {
@@ -75,29 +85,50 @@ const VoiceAIApp = () => {
       } else {
         setTranscript(data.text);
         setPartialTranscript('');
-        
-        // Add user message to conversation
-        setConversationHistory(prev => [...prev, {
-          role: 'user',
-          content: data.text,
-          timestamp: Date.now(),
-          confidence: data.confidence || 0.9
-        }]);
+
+        // Add user message to conversation (new messages at top)
+        setConversationHistory(prev => [
+          {
+            role: 'user',
+            content: data.text,
+            timestamp: Date.now(),
+            confidence: data.confidence || 0.9
+          },
+          ...prev
+        ]);
       }
     });
 
     newSocket.on('audio_chunk', (data) => {
       console.log('Received audio chunk:', data);
-      playAudioChunk(data);
       
+      // Start progress bar if not already processing
+      if (!isProcessing) {
+        setIsProcessing(true);
+        setProcessingProgress(0);
+        
+        // Simulate progress updates
+        progressIntervalRef.current = setInterval(() => {
+          setProcessingProgress(prev => {
+            const newProgress = Math.min(prev + 10, 90); // Cap at 90% until audio completes
+            return newProgress;
+          });
+        }, 200);
+      }
+      
+      playAudioChunk(data);
+
       // Add AI response to conversation when complete
       if (data.is_final) {
-        setConversationHistory(prev => [...prev, {
-          role: 'assistant',
-          content: data.sentence || 'Audio response',
-          timestamp: Date.now(),
-          type: 'audio'
-        }]);
+        setConversationHistory(prev => [
+          {
+            role: 'assistant',
+            content: data.sentence || 'Audio response',
+            timestamp: Date.now(),
+            type: 'audio'
+          },
+          ...prev
+        ]);
       }
     });
 
@@ -109,10 +140,36 @@ const VoiceAIApp = () => {
       setSystemStatus('processing');
     });
 
+    newSocket.on('processing_complete', () => {
+      // Complete the progress bar
+      setProcessingProgress(100);
+      setTimeout(() => {
+        setIsProcessing(false);
+        setProcessingProgress(0);
+        if (progressIntervalRef.current) {
+          clearInterval(progressIntervalRef.current);
+          progressIntervalRef.current = null;
+        }
+      }, 500);
+    });
+
     newSocket.on('error', (errorData) => {
       console.error('Backend error:', errorData);
-      setError(errorData.message || 'Unknown error');
+      
+      // Handle rate limit errors specifically
+      if (errorData.message?.includes('RateLimitReached') || 
+          errorData.message?.includes('429')) {
+        const waitTime = errorData.details?.match(/wait (\d+) seconds/)?.[1] || 0;
+        setRetryTime(parseInt(waitTime));
+        setRateLimitError({
+          message: 'AI service rate limit reached',
+          details: `Please try again in ${Math.ceil(waitTime/60)} minutes`
+        });
+      } else {
+        setError(errorData.message || 'Unknown error');
+      }
     });
+
 
     setSocket(newSocket);
 
@@ -120,9 +177,24 @@ const VoiceAIApp = () => {
       if (newSocket) {
         newSocket.close();
       }
+      if (progressIntervalRef.current) {
+        clearInterval(progressIntervalRef.current);
+      }
     };
   }, []);
 
+  const formatTimeRemaining = (seconds) => {
+    if (seconds <= 0) return 'now';
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const secs = seconds % 60;
+    
+    return [
+      hours > 0 ? `${hours}h` : '',
+      minutes > 0 ? `${minutes}m` : '',
+      `${secs}s`
+    ].filter(Boolean).join(' ');
+  };
   // Initialize audio context and media stream
   const initializeAudio = useCallback(async () => {
     try {
@@ -152,7 +224,7 @@ const VoiceAIApp = () => {
       mediaRecorderRef.current.ondataavailable = (event) => {
         if (event.data.size > 0) {
           audioChunksRef.current.push(event.data);
-          
+
           // Send audio chunk to backend as base64
           if (socket && sessionId) {
             const reader = new FileReader();
@@ -202,6 +274,60 @@ const VoiceAIApp = () => {
     }
   }, [socket, sessionId]);
 
+  // Play audio chunk received from backend
+  const playAudioChunk = useCallback((audioData) => {
+    try {
+      // Stop any currently playing audio
+      if (activeAudio) {
+        activeAudio.pause();
+        URL.revokeObjectURL(activeAudio.src);
+      }
+
+      // Decode base64 audio data
+      const audioBytes = atob(audioData.audio_data);
+      const audioArray = new Uint8Array(audioBytes.length);
+      for (let i = 0; i < audioBytes.length; i++) {
+        audioArray[i] = audioBytes.charCodeAt(i);
+      }
+
+      // Create audio blob and play
+      const audioBlob = new Blob([audioArray], { type: 'audio/mp3' });
+      const audioUrl = URL.createObjectURL(audioBlob);
+      
+      const newAudio = new Audio(audioUrl);
+      setActiveAudio(newAudio);
+
+      newAudio.onplay = () => {
+        setIsPlaying(true);
+      };
+
+      newAudio.onended = () => {
+        setIsPlaying(false);
+        URL.revokeObjectURL(audioUrl);
+        setActiveAudio(null);
+      };
+
+      newAudio.onerror = (error) => {
+        console.error('Audio playback error:', error);
+        setIsPlaying(false);
+        URL.revokeObjectURL(audioUrl);
+        setActiveAudio(null);
+      };
+
+      newAudio.play().catch(error => {
+        console.error('Audio playback failed:', error);
+      });
+
+    } catch (error) {
+      console.error('Audio processing error:', error);
+      setIsProcessing(false);
+      if (progressIntervalRef.current) {
+        clearInterval(progressIntervalRef.current);
+        progressIntervalRef.current = null;
+      }
+    }
+  }, [activeAudio]);
+
   // Start recording audio
   const startRecording = useCallback(async () => {
     if (!socket || !sessionId) {
@@ -242,44 +368,6 @@ const VoiceAIApp = () => {
       console.log('Recording stopped');
     }
   }, [socket, sessionId]);
-
-  // Play audio chunk received from backend
-  const playAudioChunk = useCallback((audioData) => {
-    try {
-      // Decode base64 audio data
-      const audioBytes = atob(audioData.audio_data);
-      const audioArray = new Uint8Array(audioBytes.length);
-      for (let i = 0; i < audioBytes.length; i++) {
-        audioArray[i] = audioBytes.charCodeAt(i);
-      }
-
-      // Create audio blob and play
-      const audioBlob = new Blob([audioArray], { type: 'audio/mp3' });
-      const audioUrl = URL.createObjectURL(audioBlob);
-      
-      const audio = new Audio(audioUrl);
-      audio.onloadeddata = () => {
-        setIsPlaying(true);
-        audio.play().catch(error => {
-          console.error('Audio playback failed:', error);
-        });
-      };
-      
-      audio.onended = () => {
-        setIsPlaying(false);
-        URL.revokeObjectURL(audioUrl);
-      };
-
-      audio.onerror = (error) => {
-        console.error('Audio playback error:', error);
-        setIsPlaying(false);
-        URL.revokeObjectURL(audioUrl);
-      };
-
-    } catch (error) {
-      console.error('Audio processing error:', error);
-    }
-  }, []);
 
   // Toggle recording state
   const toggleRecording = useCallback(() => {
@@ -326,8 +414,15 @@ const VoiceAIApp = () => {
       if (audioContextRef.current) {
         audioContextRef.current.close();
       }
+      if (progressIntervalRef.current) {
+        clearInterval(progressIntervalRef.current);
+      }
+      if (activeAudio) {
+        activeAudio.pause();
+        URL.revokeObjectURL(activeAudio.src);
+      }
     };
-  }, []);
+  }, [activeAudio]);
 
   // Render component
   return (
@@ -350,6 +445,30 @@ const VoiceAIApp = () => {
         </div>
       )}
 
+{/* Rate Limit Specific Warning */}
+      {rateLimitError && (
+        <div className="rate-limit-banner">
+          <div className="rate-limit-content">
+            <span>⚠️ {rateLimitError.message}</span>
+            <span>{rateLimitError.details}</span>
+            {retryTime > 0 && (
+              <div className="retry-timer">
+                <span>Time remaining: {formatTimeRemaining(retryTime)}</span>
+                <div className="timer-progress">
+                  <div 
+                    style={{ 
+                      width: `${100 - (retryTime / (retryTime + 60) * 100)}%` 
+                    }}
+                  ></div>
+                </div>
+              </div>
+            )}
+          </div>
+          <button onClick={() => setRateLimitError(null)}>✕</button>
+        </div>
+      )}
+
+
       {/* Main Interface */}
       <main className="main-content">
         {/* Voice Controls */}
@@ -364,6 +483,15 @@ const VoiceAIApp = () => {
             </div>
             <span>{isRecording ? 'Stop Recording' : 'Start Recording'}</span>
           </button>
+
+          {isProcessing && (
+            <div className="progress-container">
+              <div className="progress-bar" style={{ width: `${processingProgress}%` }}></div>
+              <span className="progress-text">
+                {processingProgress < 100 ? `Processing... ${processingProgress}%` : 'Processing complete'}
+              </span>
+            </div>
+          )}
 
           {isPlaying && (
             <div className="playback-indicator">
@@ -397,7 +525,7 @@ const VoiceAIApp = () => {
         {/* Conversation History */}
         <div className="conversation-section">
           <div className="conversation-header">
-            <h3>Conversation History</h3>
+            <h3>Conversation History (Newest First)</h3>
             <button className="clear-button" onClick={clearConversation}>
               Clear
             </button>
@@ -409,7 +537,7 @@ const VoiceAIApp = () => {
               </div>
             ) : (
               conversationHistory.map((message, index) => (
-                <div key={index} className={`message ${message.role}`}>
+                <div key={`${message.timestamp}-${index}`} className={`message ${message.role}`}>
                   <div className="message-header">
                     <span className="role-badge">
                       {message.role === 'user' ? '👤' : '🤖'} {message.role}
@@ -435,24 +563,36 @@ const VoiceAIApp = () => {
 
         {/* System Metrics */}
         <div className="metrics-section">
-          <h3>System Metrics</h3>
-          <div className="metrics-grid">
-            {Object.entries(metrics).map(([key, value]) => (
-              <div key={key} className="metric-card">
-                <div className="metric-label">{key.replace(/_/g, ' ')}</div>
+        <h3>System Metrics</h3>
+        <div className="metrics-grid">
+          {Object.keys(metrics).length > 0 ? (
+            <>
+              {Object.entries(metrics).map(([key, value]) => (
+                <div key={key} className="metric-card">
+                  <div className="metric-label">{key.replace(/_/g, ' ')}</div>
+                  <div className="metric-value">
+                    {typeof value === 'object' ? 
+                      `${value.average?.toFixed(2)} (${value.count} samples)` : 
+                      value.toString()}
+                  </div>
+                </div>
+              ))}
+              {/* Add rate limit status */}
+              <div className="metric-card rate-limit-status">
+                <div className="metric-label">API Rate Limit</div>
                 <div className="metric-value">
-                  {typeof value === 'object' ? 
-                    `${value.average?.toFixed(2)} (${value.count} samples)` : 
-                    value
-                  }
+                  {rateLimitError ? 'Exceeded' : 'Normal'}
                 </div>
               </div>
-            ))}
-            {Object.keys(metrics).length === 0 && (
-              <div className="no-metrics">No metrics available yet</div>
-            )}
-          </div>
+            </>
+          ) : (
+            <div className="no-metrics">
+              <p>Collecting system metrics...</p>
+              <p>Metrics will appear here shortly</p>
+            </div>
+          )}
         </div>
+      </div>
       </main>
 
       {/* Footer */}

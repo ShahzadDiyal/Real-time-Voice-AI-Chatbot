@@ -15,7 +15,7 @@ import logging
 import io
 import base64
 import numpy as np
-
+from threading import Lock
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_cors import CORS
@@ -44,15 +44,15 @@ socketio = SocketIO(
     cors_allowed_origins="http://localhost:5173",
     async_mode="threading",
     ping_timeout=60,
-    ping_interval=25,
+    ping_interval=250,
 )
 
 # Configuration
 class Config:
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-    GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "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")
+    GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "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")
     MAX_CONCURRENT_SESSIONS = int(os.getenv("MAX_CONCURRENT_SESSIONS", "1000"))
-    AUDIO_CHUNK_SIZE = 1024
+    AUDIO_CHUNK_SIZE = 5 * 1024 * 1024
     SAMPLING_RATE = 16000
     LATENCY_TARGET_MS = 500
 
@@ -211,7 +211,7 @@ class SessionGateway:
 class ListenerAgent:
     def __init__(self):
         self.voice_activity_threshold = 0.1
-        self.silence_timeout = 2.0
+        self.silence_timeout = 20.0
 
     def detect_voice_activity(self, audio_chunk: AudioChunk) -> bool:
         try:
@@ -457,14 +457,27 @@ class ContextMemoryAgent:
 class LLMReasoningAgent:
     def __init__(self):
         self.client = OpenAI(
-            base_url="https://models.github.ai/inference/v1",
+            #for OpenAI
+            # base_url="https://models.github.ai/inference/v1",
+            
+            # for Deepseek
+            base_url="https://models.github.ai/inference",
             api_key=Config.GITHUB_TOKEN,
+            max_retries=2
         )
-        self.model_name = "openai/gpt-4o"
+        self.model_name = "deepseek/DeepSeek-V3-0324"
         self.response_cache = {}
+        self.rate_limit_cache = {}
 
     def generate_response(self, request: Dict) -> LLMResponse:
         start_time = time.time()
+        cache_key = hash(request["message"])
+        
+        if cache_key in self.rate_limit_cache:
+            if time.time() < self.rate_limit_cache[cache_key]:
+                raise OpenAIError("Rate limit cooldown active")
+            
+            
         try:
             cache_key = hash(request["message"])
             if cache_key in self.response_cache:
@@ -495,18 +508,12 @@ class LLMReasoningAgent:
                 processing_time=time.time() - start_time,
             )
         except OpenAIError as e:
-            logger.error(f"GitHub Models LLM error: {e}")
-            socketio.emit(
-                "error",
-                {"message": f"LLM error: {str(e)}", "session_id": request["session_id"]},
-                room=request["session_id"],
-            )
-            return LLMResponse(
-                text="I apologize, but I'm having trouble processing your request right now.",
-                tool_calls=[],
-                confidence=0.1,
-                processing_time=time.time() - start_time,
-            )
+            if "429" in str(e):
+                # Cache rate limit with expiry
+                cooldown = self._extract_cooldown_time(str(e)) or 3600
+                self.rate_limit_cache[cache_key] = time.time() + cooldown
+                logger.warning(f"Rate limited, cooling down for {cooldown}s")
+            raise
         except Exception as e:
             logger.error(f"LLM generation error: {e}")
             socketio.emit(
@@ -537,46 +544,51 @@ class LLMReasoningAgent:
 # 7. Text-to-Speech Agent (gTTS)
 class TextToSpeechAgent:
     def __init__(self):
-        pass
-
+        self.lock = threading.Lock()
+        self.audio_cache = {}
+        
     def synthesize_speech(self, session_id: str, text: str):
         try:
-            start_time = time.time()
-            sentences = self._chunk_text(text)
-            for i, sentence in enumerate(sentences):
-                is_final = i == len(sentences) - 1
-                logger.info(f"Generating TTS for sentence: {sentence}")
-                tts = gtts.gTTS(text=sentence, lang="en", slow=False)
-                audio_io = io.BytesIO()
-                tts.write_to_fp(audio_io)
-                audio_bytes = audio_io.getvalue()
-                audio_data = base64.b64encode(audio_bytes).decode()
+            with self.lock:
+                # Check cache first
+                if text in self.audio_cache:
+                    audio_data = self.audio_cache[text]
+                else:
+                    # Create TTS without unsupported parameters
+                    tts = gtts.gTTS(text=text, lang="en", slow=False)
+                    audio_io = io.BytesIO()
+                    tts.write_to_fp(audio_io)
+                    audio_bytes = audio_io.getvalue()
+                    audio_data = base64.b64encode(audio_bytes).decode()
+                    self.audio_cache[text] = audio_data
+                
+                # Emit audio chunks with proper sequencing
                 socketio.emit(
                     "audio_chunk",
                     {
                         "audio_data": audio_data,
-                        "is_final": is_final,
-                        "sentence": sentence,
+                        "is_final": True,
+                        "sentence": text,
                         "session_id": session_id,
+                        "chunk_id": str(uuid.uuid4())
                     },
                     room=session_id,
                 )
-                time.sleep(0.05)
-            processing_time = time.time() - start_time
-            logger.info(f"TTS processing time: {processing_time:.2f}s")
+                
+                # Emit processing complete event
+                socketio.emit(
+                    "processing_complete",
+                    {"session_id": session_id},
+                    room=session_id
+                )
+                
         except Exception as e:
-            logger.error(f"gTTS TTS error: {e}")
+            logger.error(f"TTS error: {e}")
             socketio.emit(
                 "error",
                 {"message": f"TTS error: {str(e)}", "session_id": session_id},
                 room=session_id,
             )
-
-    def _chunk_text(self, text: str) -> List[str]:
-        import re
-        sentences = re.split(r"[.!?]+", text)
-        return [s.strip() for s in sentences if s.strip()]
-
 # 8. Analytics and Quality Agent
 class AnalyticsAgent:
     def __init__(self):
