@@ -50,7 +50,7 @@ socketio = SocketIO(
 # Configuration
 class Config:
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-    GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "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")
+    GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "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")
     MAX_CONCURRENT_SESSIONS = int(os.getenv("MAX_CONCURRENT_SESSIONS", "1000"))
     AUDIO_CHUNK_SIZE = 5 * 1024 * 1024
     SAMPLING_RATE = 16000
@@ -358,7 +358,7 @@ class OrchestrationAgent:
 
             full_audio = audio_accumulator.add_chunk(session_id, audio_chunk.data, audio_chunk.is_final)
             if full_audio is not None:
-                # Process full audio when is_final = True
+                # Process full audio when is_final = True           
                 transcript = self.stt_agent.process_audio_stream(full_audio, session_id)
                 if not transcript:
                     logger.warning(f"No transcript generated for session {session_id}")
@@ -458,26 +458,19 @@ class LLMReasoningAgent:
     def __init__(self):
         self.client = OpenAI(
             #for OpenAI
-            # base_url="https://models.github.ai/inference/v1",
+            base_url="https://models.github.ai/inference/v1",
             
             # for Deepseek
-            base_url="https://models.github.ai/inference",
+            # base_url="https://models.github.ai/inference",
             api_key=Config.GITHUB_TOKEN,
-            max_retries=2
+            
         )
-        self.model_name = "deepseek/DeepSeek-V3-0324"
+        # self.model_name = "deepseek/DeepSeek-V3-0324"
+        self.model_name = "openai/gpt-4o"
         self.response_cache = {}
-        self.rate_limit_cache = {}
 
     def generate_response(self, request: Dict) -> LLMResponse:
         start_time = time.time()
-        cache_key = hash(request["message"])
-        
-        if cache_key in self.rate_limit_cache:
-            if time.time() < self.rate_limit_cache[cache_key]:
-                raise OpenAIError("Rate limit cooldown active")
-            
-            
         try:
             cache_key = hash(request["message"])
             if cache_key in self.response_cache:
@@ -508,12 +501,18 @@ class LLMReasoningAgent:
                 processing_time=time.time() - start_time,
             )
         except OpenAIError as e:
-            if "429" in str(e):
-                # Cache rate limit with expiry
-                cooldown = self._extract_cooldown_time(str(e)) or 3600
-                self.rate_limit_cache[cache_key] = time.time() + cooldown
-                logger.warning(f"Rate limited, cooling down for {cooldown}s")
-            raise
+            logger.error(f"GitHub Models LLM error: {e}")
+            socketio.emit(
+                "error",
+                {"message": f"LLM error: {str(e)}", "session_id": request["session_id"]},
+                room=request["session_id"],
+            )
+            return LLMResponse(
+                text="I apologize, but I'm having trouble processing your request right now.",
+                tool_calls=[],
+                confidence=0.1,
+                processing_time=time.time() - start_time,
+            )
         except Exception as e:
             logger.error(f"LLM generation error: {e}")
             socketio.emit(
@@ -768,6 +767,31 @@ def handle_stop_recording(data):
         emit("recording_stopped", {"session_id": session_id}, room=session_id)
         logger.info(f"Recording stopped for session: {session_id}")
 
+
+@socketio.on('restore_session')
+def handle_restore_session(data):
+    session_id = data.get('id')
+    session = session_gateway.get_session(session_id)
+    if session:
+        # Get conversation history from database
+        conn = sqlite3.connect("voice_ai.db")
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT role, content, timestamp FROM conversations WHERE session_id = ? ORDER BY timestamp",
+            (session_id,)
+        )
+        history = [
+            {"role": row[0], "content": row[1], "timestamp": row[2]}
+            for row in cursor.fetchall()
+        ]
+        conn.close()
+        
+        emit('session_restored', {
+            "session_id": session_id,
+            "history": history
+        })
+    else:
+        emit('session_error', {"message": "Session not found"})
 # REST API Endpoints
 @app.route("/api/health", methods=["GET"])
 def health_check():
