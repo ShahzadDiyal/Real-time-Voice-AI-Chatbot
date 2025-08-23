@@ -521,6 +521,7 @@ const VoiceAIApp = () => {
 
       <footer className="app-footer">
         <div className="footer-info">
+          <h3>Built by Shahzad💖</h3>
           <p>Voice AI Platform - Real-time Voice Conversations</p>
           <p>Status: {systemStatus} | Connected: {isConnected ? 'Yes' : 'No'}</p>
         </div>
