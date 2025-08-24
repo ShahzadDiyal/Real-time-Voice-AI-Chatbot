@@ -112,8 +112,8 @@ It leverages **React (frontend)**, **Flask + Socket.IO (backend)**, **Whisper (S
 ### Clone Repo  
 
 ```bash
-git clone https://github.com/yourusername/voice-ai-system.git
-cd voice-ai-system
+git clone https://github.com/ShahzadDiyal/Real-time-Voice-AI-Chatbot.git
+cd Real-time-Voice-AI-Chatbot
 ```
 
 ---
